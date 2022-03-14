@@ -249,7 +249,7 @@ class STPM(pl.LightningModule):
             self.features.append(output)
         
         if "dino_vit" in args.backbone:
-            self.extractor = ViTExtractor(model_type=args.backbone, stride=4)
+            self.extractor = ViTExtractor(model_type=args.backbone, stride=8)
         elif args.backbone == 'wide_resnet50_2':
             # imgs should be imagenet normalized tensors. shape BxCxHxW
             self.model = torch.hub.load('pytorch/vision:v0.9.0', 'wide_resnet50_2', pretrained=True)
