@@ -1,32 +1,28 @@
-from sklearn.random_projection import SparseRandomProjection
-from sampling_methods.kcenter_greedy import kCenterGreedy
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import confusion_matrix
-from scipy.ndimage import gaussian_filter
-from sklearn.metrics import roc_auc_score
-from torch.nn import functional as F
-from torchvision import transforms
-import pytorch_lightning as pl
-from PIL import Image
-import numpy as np
 import argparse
-import shutil
-import faiss
-import torch
 import glob
-import cv2
 import os
-
-from PIL import Image
-from sklearn.metrics import roc_auc_score
-from torch import nn
-import pytorch_lightning as pl
-from sklearn.metrics import confusion_matrix
 import pickle
-from sampling_methods.kcenter_greedy import kCenterGreedy
-from sklearn.random_projection import SparseRandomProjection
-from sklearn.neighbors import NearestNeighbors
+import shutil
+from os.path import join
+
+import cv2
+import faiss
+import matplotlib.pyplot as plt
+import numpy as np
+import pytorch_lightning as pl
+import torch
+import wandb
+from PIL import Image
 from scipy.ndimage import gaussian_filter
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.random_projection import SparseRandomProjection
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
+from sampling_methods.kcenter_greedy import kCenterGreedy
 
 
 def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
@@ -105,16 +101,16 @@ def copy_files(src, dst, ignores=[]):
 def prep_dirs(root):
     # make embeddings dir
     # embeddings_path = os.path.join(root, 'embeddings')
-    embeddings_path = os.path.join('./', 'embeddings', args.category)
+    embeddings_path = os.path.join(root.rsplit('/', 2)[0], 'embeddings', args.category)
     os.makedirs(embeddings_path, exist_ok=True)
     # make sample dir
     sample_path = os.path.join(root, 'sample')
     os.makedirs(sample_path, exist_ok=True)
-    # make source code record dir & copy
-    source_code_save_path = os.path.join(root, 'src')
-    os.makedirs(source_code_save_path, exist_ok=True)
-    copy_files('./', source_code_save_path, ['.git','.vscode','__pycache__','logs','README','samples','LICENSE']) # copy source code
-    return embeddings_path, sample_path, source_code_save_path
+    # # make source code record dir & copy
+    # source_code_save_path = os.path.join(root, 'src')
+    # os.makedirs(source_code_save_path, exist_ok=True)
+    # copy_files('./', source_code_save_path, ['.git','.vscode','__pycache__','logs','README','samples','LICENSE']) # copy source code
+    return embeddings_path, sample_path
 
 def embedding_concat(x, y):
     # from https://github.com/xiahaifeng1995/PaDiM-Anomaly-Detection-Localization-master
@@ -162,7 +158,7 @@ class MVTecDataset(Dataset):
         tot_labels = []
         tot_types = []
 
-        defect_types = os.listdir(self.img_path)
+        defect_types = sorted(os.listdir(self.img_path))
         
         for defect_type in defect_types:
             if defect_type == 'good':
@@ -276,6 +272,11 @@ class STPM(pl.LightningModule):
 
         self.inv_normalize = transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], std=[1/0.229, 1/0.224, 1/0.255])
 
+        self.imgs = []
+        self.maps = []
+        self.x_types = []
+
+
     def init_results_list(self):
         self.gt_list_px_lvl = []
         self.pred_list_px_lvl = []
@@ -322,16 +323,16 @@ class STPM(pl.LightningModule):
 
     def on_train_start(self):
         self.model.eval() # to stop running_var move (maybe not critical)
-        self.embedding_dir_path, self.sample_path, self.source_code_save_path = prep_dirs(self.logger.log_dir)
+        self.embedding_dir_path, self.sample_path = prep_dirs(self.logger.log_dir)
         self.embedding_list = []
     
     def on_test_start(self):
+        self.embedding_dir_path, self.sample_path = prep_dirs(self.logger.log_dir)
         self.index = faiss.read_index(os.path.join(self.embedding_dir_path,'index.faiss'))
-        if torch.cuda.is_available():
-            res = faiss.StandardGpuResources()
-            self.index = faiss.index_cpu_to_gpu(res, 0 ,self.index)
+        # if torch.cuda.is_available():
+        #     res = faiss.StandardGpuResources()
+        #     self.index = faiss.index_cpu_to_gpu(res, 0 ,self.index)
         self.init_results_list()
-        self.embedding_dir_path, self.sample_path, self.source_code_save_path = prep_dirs(self.logger.log_dir)
         
     def training_step(self, batch, batch_idx): # save locally aware patch features
         x, _, _, file_name, _ = batch
@@ -359,7 +360,55 @@ class STPM(pl.LightningModule):
         self.index = faiss.IndexFlatL2(self.embedding_coreset.shape[1])
         self.index.add(self.embedding_coreset) 
         faiss.write_index(self.index,  os.path.join(self.embedding_dir_path,'index.faiss'))
+    
+    def t2np(self, tensor):
+        '''pytorch tensor -> numpy array'''
+        return tensor.cpu().data.numpy() if tensor is not None else None
 
+    def viz_map_array(self, category, n_col=8, subsample=4, max_figures=-1):
+        plt.clf()
+        fig, subplots = plt.subplots(3, n_col)
+
+        fig_count = -1
+        col_count = -1
+        for i in range(len(self.maps)):
+            if i % subsample != 0:
+                continue
+
+            col_count = (col_count + 1) % n_col
+            if col_count == 0:
+                if fig_count >= 0:
+                    plt.savefig(join(self.sample_path, str(fig_count) + '.jpg'), bbox_inches='tight', pad_inches=0)
+                    plt.close()
+                fig, subplots = plt.subplots(3, n_col, figsize=(22, 8))
+                fig_count += 1
+                if fig_count == max_figures:
+                    return
+
+            anomaly_description = self.x_types[i][0]
+            image = self.t2np(self.imgs[i])[0]
+            image = np.transpose(image, (1, 2, 0))
+            map = self.t2np(F.interpolate(torch.tensor(self.maps[i][None,None]), size=image.shape[:2], mode="bilinear", align_corners=False))[
+                0, 0]
+            subplots[1][col_count].imshow(map)
+            subplots[1][col_count].axis('off')
+            subplots[0][col_count].imshow(image)
+            subplots[0][col_count].axis('off')
+            subplots[0][col_count].set_title(category + ":\n" + anomaly_description)
+            subplots[2][col_count].imshow(image)
+            subplots[2][col_count].axis('off')
+            subplots[2][col_count].imshow(map, cmap='viridis', alpha=0.3)
+        for i in range(col_count, n_col):
+            subplots[0][i].axis('off')
+            subplots[1][i].axis('off')
+            subplots[2][i].axis('off')
+        if col_count > 0:
+            plt.savefig(join(self.sample_path, str(fig_count) + '.jpg'), bbox_inches='tight', pad_inches=0)
+                # Find all images in the map_export_dir directory
+        img_list = glob.glob(self.sample_path + os.sep + '*.jpg')
+        print(img_list)
+        wandb.log({"examples": [wandb.Image(img) for img in img_list]})
+        return
 
     def test_step(self, batch, batch_idx): # Nearest Neighbour Search
         x, gt, label, file_name, x_type = batch
@@ -384,17 +433,23 @@ class STPM(pl.LightningModule):
         self.gt_list_img_lvl.append(label.cpu().numpy()[0])
         self.pred_list_img_lvl.append(score)
         self.img_path_list.extend(file_name)
+
+        self.imgs.append(self.inv_normalize(x))
+        self.maps.append(anomaly_map)
+        self.x_types.append(x_type)
         # save images
         x = self.inv_normalize(x)
         input_x = cv2.cvtColor(x.permute(0,2,3,1).cpu().numpy()[0]*255, cv2.COLOR_BGR2RGB)
-        self.save_anomaly_map(anomaly_map_resized_blur, input_x, gt_np*255, file_name[0], x_type[0])
+        # self.save_anomaly_map(anomaly_map_resized_blur, input_x, gt_np*255, file_name[0], x_type[0])
 
     def test_epoch_end(self, outputs):
+        self.viz_map_array(args.category)
         print("Total pixel-level auc-roc score :")
         pixel_auc = roc_auc_score(self.gt_list_px_lvl, self.pred_list_px_lvl)
         print(pixel_auc)
         print("Total image-level auc-roc score :")
         img_auc = roc_auc_score(self.gt_list_img_lvl, self.pred_list_img_lvl)
+        wandb.log({"img_auc": img_auc, "pixel_auc": pixel_auc})
         print(img_auc)
         print('test_epoch_end')
         values = {'pixel_auc': pixel_auc, 'img_auc': img_auc}
@@ -422,9 +477,9 @@ def get_args():
     parser.add_argument('--batch_size', default=32)
     parser.add_argument('--load_size', default=256) # 256
     parser.add_argument('--input_size', default=224)
-    parser.add_argument('--coreset_sampling_ratio', default=0.001)
+    parser.add_argument('--coreset_sampling_ratio', default=0.001, type=float)
     parser.add_argument('--project_root_path', default=r'./test') # 'D:\Project_Train_Results\mvtec_anomaly_detection\210624\test') #
-    parser.add_argument('--save_src_code', default=True)
+    parser.add_argument('--save_src_code', default=False)
     parser.add_argument('--save_anomaly_map', default=True)
     parser.add_argument('--n_neighbors', type=int, default=9)
     args = parser.parse_args()
@@ -434,10 +489,22 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args = get_args()
     trainer = pl.Trainer.from_argparse_args(args, default_root_dir=os.path.join(args.project_root_path, args.category), max_epochs=args.num_epochs, gpus=1) #, check_val_every_n_epoch=args.val_freq,  num_sanity_val_steps=0) # ,fast_dev_run=True)
+    # Remove last folder from log dir
+
+    # Configure wandb
+    config = dict (
+    batch_size = args.batch_size,
+    paper = "PatchCore",
+    backbone = "wide_resnet50_2",
+    dataset_id = args.category,
+    coreset_sampling_ratio = args.coreset_sampling_ratio,
+    n_neighbors = args.n_neighbors
+    )
+    wandb.init(project="Masterarbeit", entity="antone", config=config)
+
     model = STPM(hparams=args)
     if args.phase == 'train':
         trainer.fit(model)
         trainer.test(model)
     elif args.phase == 'test':
         trainer.test(model)
-
