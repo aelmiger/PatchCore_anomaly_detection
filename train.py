@@ -1,4 +1,5 @@
 import argparse
+from ast import arg
 import glob
 import os
 import pickle
@@ -23,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from sampling_methods.kcenter_greedy import kCenterGreedy
-
+from dino_vit_features.extractor import ViTExtractor
 
 def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
 
@@ -246,14 +247,18 @@ class STPM(pl.LightningModule):
         self.init_features()
         def hook_t(module, input, output):
             self.features.append(output)
+        
+        if "dino_vit" in args.backbone:
+            self.extractor = ViTExtractor(model_type=args.backbone, stride=8)
+        elif args.backbone == 'wide_resnet50_2':
+            # imgs should be imagenet normalized tensors. shape BxCxHxW
+            self.model = torch.hub.load('pytorch/vision:v0.9.0', 'wide_resnet50_2', pretrained=True)
 
-        self.model = torch.hub.load('pytorch/vision:v0.9.0', 'wide_resnet50_2', pretrained=True)
+            for param in self.model.parameters():
+                param.requires_grad = False
 
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        self.model.layer2[-1].register_forward_hook(hook_t)
-        self.model.layer3[-1].register_forward_hook(hook_t)
+            self.model.layer2[-1].register_forward_hook(hook_t)
+            self.model.layer3[-1].register_forward_hook(hook_t)
 
         self.criterion = torch.nn.MSELoss(reduction='sum')
 
@@ -289,7 +294,14 @@ class STPM(pl.LightningModule):
 
     def forward(self, x_t):
         self.init_features()
-        _ = self.model(x_t)
+        if "dino_vit" in args.backbone:
+            descriptors = self.extractor.extract_descriptors(x_t)[:,0,:,:]
+            descriptors = descriptors.permute(0,2,1)
+            patch_grid = self.extractor.num_patches
+            descriptors = descriptors.reshape(descriptors.shape[0],-1, *patch_grid)
+            self.features.append(descriptors)
+        elif args.backbone == 'wide_resnet50_2':
+            _ = self.model(x_t)
         return self.features
 
     def save_anomaly_map(self, anomaly_map, input_img, gt_img, file_name, x_type):
@@ -322,7 +334,7 @@ class STPM(pl.LightningModule):
         return None
 
     def on_train_start(self):
-        self.model.eval() # to stop running_var move (maybe not critical)
+        # self.model.eval() # to stop running_var move (maybe not critical)
         self.embedding_dir_path, self.sample_path = prep_dirs(self.logger.log_dir)
         self.embedding_list = []
     
@@ -341,7 +353,11 @@ class STPM(pl.LightningModule):
         for feature in features:
             m = torch.nn.AvgPool2d(3, 1, 1)
             embeddings.append(m(feature))
-        embedding = embedding_concat(embeddings[0], embeddings[1])
+        if len(embeddings) == 1:
+            embedding = embeddings[0]
+            embedding = embedding.cpu().detach()
+        else:
+            embedding = embedding_concat(embeddings[0], embeddings[1])
         self.embedding_list.extend(reshape_embedding(np.array(embedding)))
 
     def training_epoch_end(self, outputs): 
@@ -418,11 +434,16 @@ class STPM(pl.LightningModule):
         for feature in features:
             m = torch.nn.AvgPool2d(3, 1, 1)
             embeddings.append(m(feature))
-        embedding_ = embedding_concat(embeddings[0], embeddings[1])
+        if len(embeddings) == 1:
+            embedding_ = embeddings[0]
+            embedding_ = embedding_.cpu().detach()
+        else:
+            embedding_ = embedding_concat(embeddings[0], embeddings[1])
         embedding_test = np.array(reshape_embedding(np.array(embedding_)))
         score_patches, _ = self.index.search(embedding_test , k=args.n_neighbors)
         anomaly_map = score_patches[:,0].reshape((28,28))
         N_b = score_patches[np.argmax(score_patches[:,0])]
+        N_b = N_b / 1000
         w = (1 - (np.max(np.exp(N_b))/np.sum(np.exp(N_b))))
         score = w*max(score_patches[:,0]) # Image-level score
         gt_np = gt.cpu().numpy()[0,0].astype(int)
@@ -474,7 +495,7 @@ def get_args():
     parser.add_argument('--dataset_path', default=r'./MVTec') # 'D:\Dataset\mvtec_anomaly_detection')#
     parser.add_argument('--category', default='hazelnut')
     parser.add_argument('--num_epochs', default=1)
-    parser.add_argument('--batch_size', default=32)
+    parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--load_size', default=256) # 256
     parser.add_argument('--input_size', default=224)
     parser.add_argument('--coreset_sampling_ratio', default=0.001, type=float)
@@ -482,6 +503,7 @@ def get_args():
     parser.add_argument('--save_src_code', default=False)
     parser.add_argument('--save_anomaly_map', default=True)
     parser.add_argument('--n_neighbors', type=int, default=9)
+    parser.add_argument('--backbone', type=str)
     args = parser.parse_args()
     return args
 
@@ -495,7 +517,7 @@ if __name__ == '__main__':
     config = dict (
     batch_size = args.batch_size,
     paper = "PatchCore",
-    backbone = "wide_resnet50_2",
+    backbone = args.backbone,
     dataset_id = args.category,
     coreset_sampling_ratio = args.coreset_sampling_ratio,
     n_neighbors = args.n_neighbors
