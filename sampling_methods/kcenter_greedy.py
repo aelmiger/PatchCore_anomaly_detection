@@ -33,6 +33,7 @@ from __future__ import print_function
 import numpy as np
 from sklearn.metrics import pairwise_distances
 from sampling_methods.sampling_def import SamplingMethod
+from tqdm import tqdm
 
 
 class kCenterGreedy(SamplingMethod):
@@ -101,7 +102,8 @@ class kCenterGreedy(SamplingMethod):
 
     new_batch = []
 
-    for _ in range(N):
+    for _ in tqdm(range(N)):
+
       if self.already_selected is None:
         # Initialize centers with a randomly selected datapoint
         ind = np.random.choice(np.arange(self.n_obs))
